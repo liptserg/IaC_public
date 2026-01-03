@@ -7,3 +7,13 @@ output "load_balancer_public_ip" {
 #  description = "DB hostname"
 #  value = local.dbhosts
 #}
+
+output "vm_linux_1_public_ip_address" {
+  description = "Virtual machine IP 1"
+  value = yandex_compute_instance.wp-app[0].network_interface[0].nat_ip_address
+}
+
+output "vm_linux_2_public_ip_address" {
+  description = "Virtual machine IP 2"
+  value = yandex_compute_instance.wp-app[1].network_interface[0].nat_ip_address
+}
