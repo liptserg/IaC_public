@@ -1,0 +1,5 @@
+plugin: yacloud_compute
+yacloud_token: "$YC_TOKEN"
+yacloud_clouds: "cloud-liptsergm"
+yacloud_folders: "otus"
+yacloud_group_label: group
