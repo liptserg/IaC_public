@@ -1,0 +1,327 @@
+- hosts: srv_db
+  gather_facts: True
+  become: True
+
+  tasks:
+    - name: "Определение локального IP"
+      shell: ip -f inet addr show eth0 | grep -v 'secondary'| sed -En -e 's/.*inet ([0-9.]+).*/\1/p'
+      register: privateIP
+
+    - name: "Вывод локальных IP"
+      debug: 
+        msg: "{{ privateIP.stdout }}"        
+
+    - name: "Установка часового пояса Europe/Moscow"
+      community.general.timezone:
+        name: Europe/Moscow
+
+    - name: "Set the ETCDCTL_API environment variable to 3, catalogs for patroni"
+      lineinfile:
+        path: /etc/profile
+        line: "{{item}}"
+        state: present
+        create: True
+        insertafter: EOF  
+      with_items:
+        - export ETCDCTL_API=3
+        - export PG_CONFIG=/usr/lib/postgresql/13/bin/pg_config
+        - export PATRONI_CONFIG_FILE=/etc/patroni/config.yml
+
+    - name: "Остановка postgresql"
+      ansible.builtin.service:
+        name: postgresql
+        state: stopped
+
+    - name: "Выключение службы postgresql"
+      ansible.builtin.service:
+        name: postgresql
+        enabled: false    
+
+    - name: "Перезапуск хостов"
+      ansible.builtin.reboot:
+        msg: "Rebooting machine via Ansible"
+        connect_timeout: 5
+        reboot_timeout: 120        
+        
+- hosts: localhost
+  gather_facts: False
+  become: False
+
+  tasks:
+    - name: "Create ~/Work/keys"
+      file:
+        path: ~/Work/keys
+        state: directory
+
+    - name: "Generate private key for each member"
+      openssl_privatekey:
+        path: ~/Work/keys/{{item}}.key
+        type: RSA
+        size: 4096
+        state: present
+        force: True
+      with_items: "{{ groups['srv_db'] }}"
+
+    - name: "Generate CSR for each member"
+      openssl_csr:
+        path: ~/Work/keys/{{item}}.csr
+        privatekey_path: ~/Work/keys/{{item}}.key
+        common_name: "{{item}}"
+        key_usage:
+          - digitalSignature
+        extended_key_usage:
+          - serverAuth
+          - clientAuth
+        subject_alt_name:
+          - IP:{{ hostvars[item]['privateIP']['stdout']}}
+          - IP:127.0.0.1
+        force: True
+      with_items: "{{ groups['srv_db'] }}"
+
+    - name: "Generate private key for CA"
+      openssl_privatekey:
+        path: ~/Work/keys/ca.key
+        type: RSA
+        size: 4096
+        state: present
+        force: True      
+
+    - name: "Generate CSR for CA"
+      openssl_csr:
+        path: ~/Work/keys/ca.csr
+        privatekey_path: ~/Work/keys/ca.key
+        common_name: ca
+        organization_name: "Organization name"
+        basic_constraints:
+          - CA:TRUE
+          - pathlen:1
+        basic_constraints_critical: True
+        key_usage:
+          - keyCertSign
+          - digitalSignature
+        force: True
+
+    - name: "Generate self-signed CA certificate"
+      openssl_certificate:
+        path: ~/Work/keys/ca.crt
+        privatekey_path: ~/Work/keys/ca.key
+        csr_path: ~/Work/keys/ca.csr
+        provider: selfsigned
+        force: True 
+
+    - name: "Generate an `etcd` member certificate signed with our own CA certificate"
+      openssl_certificate:
+        path: ~/Work/keys/{{item}}.crt
+        csr_path: ~/Work/keys/{{item}}.csr
+        ownca_path: ~/Work/keys/ca.crt
+        ownca_privatekey_path: ~/Work/keys/ca.key
+        provider: ownca
+        force: True
+      with_items: "{{ groups['srv_db'] }}"               
+
+
+- hosts: srv_db
+  gather_facts: False
+  become: True
+  vars_files:
+    - ~/Work/keys/secrets.yml
+
+  tasks:
+
+    - name: "update etc/hosts"
+      command: sed -i "s/127.0.0.1[[:space:]].*/127.0.0.1 localhost {{inventory_hostname}}/g" /etc/hosts   
+
+    - name: "Create directory for etcd configuration"
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: etcd
+        group: etcd
+        mode: 0755
+      with_items:
+        - /etc/etcd
+        - /etc/etcd/ssl
+
+    - name: "Copy over the CA certificate"
+      copy:
+        src: ~/Work/keys/ca.crt
+        remote_src: False
+        dest: /etc/etcd/ssl/ca.crt
+        owner: etcd
+        group: etcd
+        mode: 0644
+    - name: "Copy over the etcd member certificate"
+      copy:
+        src: ~/Work/keys/{{inventory_hostname}}.crt
+        remote_src: False
+        dest: /etc/etcd/ssl/server.crt
+        owner: etcd
+        group: etcd
+        mode: 0644
+    - name: "Copy over the etcd member key"
+      copy:
+        src: ~/Work/keys/{{inventory_hostname}}.key
+        remote_src: False
+        dest: /etc/etcd/ssl/server.key
+        owner: etcd
+        group: etcd
+        mode: 0600          
+
+    - name: "Stop the etcd service"
+      command: systemctl stop etcd           
+
+    - name: "Create a data directory"
+      file:
+        path: /var/lib/etcd/default
+        state: "{{ item }}"
+        owner: root
+        group: root
+        mode: 0755
+      with_items:
+        - absent
+#        - directory
+
+    - name: "Create configuration file for etcd"
+      template:
+        src: templates/etcd.conf.j2
+        dest: /etc/default/etcd
+        owner: root
+        group: root
+        mode: 0600
+
+    - name: "Start the etcd service"
+      command: systemctl restart etcd
+
+    - name: "etcd health"
+      shell: "export ETCDCTL_API=3; etcdctl --cacert /etc/etcd/ssl/ca.crt member list -w table|grep started|wc -l"
+      register: etcd_health
+
+    - name: "Create directories for postgres and patroni"
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: 0700
+      with_items:
+        - /opt/data
+        - /opt/data/13
+        - /opt/data/log 
+        - /opt/data/log/patroni        
+        - /etc/patroni/ssl
+
+    - name: "Copy over the CA certificate"
+      copy:
+        src: ~/Work/keys/ca.crt
+        remote_src: False
+        dest: /etc/patroni/ssl/ca.crt
+        owner: postgres
+        group: postgres
+        mode: 0644
+    - name: "Copy over the patroni member certificate"
+      copy:
+        src: ~/Work/keys/{{inventory_hostname}}.crt
+        remote_src: False
+        dest: /etc/patroni/ssl/server.crt
+        owner: postgres
+        group: postgres
+        mode: 0644
+    - name: "Copy over the patroni member key"
+      copy:
+        src: ~/Work/keys/{{inventory_hostname}}.key
+        remote_src: False
+        dest: /etc/patroni/ssl/server.key
+        owner: postgres
+        group: postgres
+        mode: 0600     
+
+    - name: "Restart service patroni"
+      ansible.builtin.service:
+        name: patroni
+        state: stopped        
+
+    # - name: "Copy secrets.env"
+    #   copy:
+    #     src: ~/Work/keys/secrets.env
+    #     remote_src: False
+    #     dest: /var/lib/postgresql/.secrets.env
+    #     owner: postgres
+    #     group: postgres
+    #     mode: 0600              
+
+    - name: "Create configuration file for patroni"
+      template:
+        src: templates/patroni.yml.j2
+        dest: /etc/patroni/config.yml
+        owner: postgres
+        group: postgres
+        mode: 0600      
+
+    # - name: "Смена файла с переменными среды"
+    #   lineinfile:
+    #     path: /lib/systemd/system/patroni.service
+    #     regexp: '^EnvironmentFile='
+    #     line: EnvironmentFile=-/var/lib/postgresql/.secrets.env
+    #     insertafter: '^\[Service\]'
+    #     state: present
+
+    # - name: "systemctl daemon-reload"
+    #   command: systemctl daemon-reload        
+
+    - name: "Restart service patroni"
+      ansible.builtin.systemd_service:
+        name: patroni
+        # daemon_reload: true
+        state: started
+
+    - name: "Create configuration file for keepalived"
+      template:
+        src: templates/keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: postgres
+        group: postgres
+        mode: 0600      
+
+    - name: "Copy script"
+      copy:
+        src: files/keepalived.script
+        remote_src: False
+        dest: /var/lib/postgresql/keepalived_check.sh
+        owner: postgres
+        group: postgres
+        mode: 0755            
+
+    - name: "Restart service keepalived"
+      ansible.builtin.service:
+        name: keepalived
+        state: restarted
+
+    - name: "Замена параметра ETCD_INITIAL_CLUSTER_STATE с new на existing"
+      lineinfile:
+        path: /etc/default/etcd
+        regexp: '^ETCD_INITIAL_CLUSTER_STATE='
+        line: ETCD_INITIAL_CLUSTER_STATE="existing"
+        state: present
+      when: etcd_health.stdout == '3'
+
+
+- hosts: srv_haproxy
+  gather_facts: False
+  become: True
+  vars_files:
+    - ~/Work/keys/secrets.yml
+
+  tasks:
+
+    - name: "Create configuration file for haproxy"
+      template:
+        src: templates/haproxy.conf.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: 0644  
+
+    - name: "Restart service haproxy"
+      ansible.builtin.service:
+        name: haproxy
+        state: restarted

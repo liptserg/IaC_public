@@ -1,0 +1,79 @@
+#---------------------------------------------------------------------
+# Глобальные настройки
+#---------------------------------------------------------------------
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
+    daemon
+    tune.ssl.default-dh-param 2048
+
+#---------------------------------------------------------------------
+# Настройки по умолчанию
+#---------------------------------------------------------------------
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    retries 3
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+    timeout check 5s
+    maxconn 3000
+
+#---------------------------------------------------------------------
+# Статистика HAProxy (опционально)
+#---------------------------------------------------------------------
+listen stats
+    mode http
+    bind *:7000
+    stats enable
+    stats uri /stats
+    stats realm "HAProxy Statistics"
+    stats auth admin:{{ HAPROXY_ADMIN_PASSWORD }}
+    stats refresh 10s
+
+#---------------------------------------------------------------------
+# Основной фронтенд для подключения клиентов
+#---------------------------------------------------------------------
+frontend postgres_frontend
+    bind *:5432
+    mode tcp
+    default_backend postgres_primary
+
+#---------------------------------------------------------------------
+# Бэкенд для лидера (основной, read-write)
+#---------------------------------------------------------------------
+backend postgres_primary
+    mode tcp
+    balance roundrobin
+
+    # Проверка через HTTPS (вместо HTTP)
+    option httpchk GET /primary
+    http-check expect status 200
+
+    # Серверы: проверка на порт 8008 через HTTPS
+    # Используем ssl verify none для самоподписанных сертификатов
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+
+    server srv-db21 10.3.0.21:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200
+    server srv-db22 10.3.0.22:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200
+    server srv-db23 10.3.0.23:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200
+
+#---------------------------------------------------------------------
+# Опционально: бэкенд для реплик (только чтение)
+#---------------------------------------------------------------------
+listen postgres_replicas
+    bind *:5433
+    mode tcp
+    balance roundrobin
+
+    option httpchk GET /replica
+    http-check expect status 200
+
+    server srv-db21 10.3.0.21:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200
+    server srv-db22 10.3.0.22:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200
+    server srv-db23 10.3.0.23:5432 check port 8008 check-ssl verify none alpn http/1.1 maxconn 200

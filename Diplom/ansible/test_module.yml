@@ -1,0 +1,15 @@
+- hosts: localhost
+  gather_facts: False
+  become: True
+  
+  vars_files:
+    - var/secrets.yml
+
+  tasks:
+    - name: "update etc/hosts"
+      command: echo "{{ POSTGRES_ADMIN_PASSWORD }}" ; echo "{{ HAPROXY_ADMIN_PASSWORD }}" ;
+      register: result
+
+    - name: "Вывод результатов команды"
+      debug: 
+        msg: "{{ result.stdout }}"  

@@ -1,0 +1,36 @@
+global_defs{
+  router_id srv-db
+  enable_script_security
+  script_user postgres
+  max_auto_priority 99
+  log_facility LOCAL0
+}
+
+vrrp_script check_psql_master {
+  script /var/lib/postgresql/keepalived_check.sh
+  interval 2
+  weight 0
+  rise 2
+  fall 2
+}
+
+vrrp_instance VIP_CLU{
+  interface eth0
+  state BACKUP
+  nopreempt
+  virtual_router_id 150
+  priority 100
+
+  authentication{
+    auth_type pars
+    auth_pars passw0rd04
+  }
+
+  virtual_ipaddress{
+    10.3.0.25/24 dev eth0
+  }
+
+  track_script{
+    check_psql_master
+  }
+}
